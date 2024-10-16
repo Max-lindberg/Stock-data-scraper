@@ -1,4 +1,3 @@
-# scraper.rb
 require 'ferrum'
 require 'nokogiri'
 require 'faker'
@@ -7,10 +6,10 @@ require 'uri'
 require 'net/http'
 require 'json'
 
-class SeekingAlphaScraper
-  BASE_URL = "https://seekingalpha.com/symbol"
+class YahooFinanceScraper
+  BASE_URL = "https://finance.yahoo.com/quote"
 
-  MAX_RETRIES = 3
+  MAX_RETRIES = 1
 
   def initialize(symbol_list)
     @symbol_list = symbol_list
@@ -22,18 +21,29 @@ class SeekingAlphaScraper
       success = false
 
       while retries < MAX_RETRIES && !success
-        puts "Henter data for: #{symbol} (Forsøg #{retries + 1}/#{MAX_RETRIES})"
+        puts "Henter data for: #{symbol} (Forsøg #{retries + 1}/#{MAX_RETRIES}a)"
 
         begin
           setup_browser
 
-          check_robots_txt
-
-          url = "#{BASE_URL}/#{symbol}/income-statement"
+          url = "#{BASE_URL}/#{symbol}/financials?p=#{symbol}"
           @browser.go_to(url)
 
-          # Tilfældig ventetid mellem 5 og 15 sekunder
-          sleep(rand(5..15))
+          # Vent indtil siden er fuldt indlæst
+          sleep(5)
+
+          # Brug JavaScript til at klikke på knapperne, hvis de findes
+          if @browser.at_css("#scroll-down-btn")
+            @browser.execute("document.querySelector('#scroll-down-btn').click()")
+            sleep(2)
+          end
+          if @browser.at_css("button.reject-all")
+            @browser.execute("document.querySelector('button.reject-all').click()")
+            sleep(2)
+          end
+
+          # Vent yderligere for at sikre, at siden er klar
+          sleep(5)
 
           page = @browser.body
           parse_page(page, symbol)
@@ -84,29 +94,27 @@ class SeekingAlphaScraper
     user_agents.sample
   end
 
-
   def parse_page(page, symbol)
     doc = Nokogiri::HTML(page)
-    table = doc.at_css('table[data-test-id="table"]') # Finder tabellen baseret på dens 'data-test-id'
+    section = doc.at_css('section.container.yf-1pgoo1f') # Finder sektionen med den ønskede tabel
 
-    if table
-      headers = table.css('thead th').map(&:text).map(&:strip) # Henter overskrifterne (årstal eller datafelter)
-      rows = table.css('tbody tr')    # Henter alle rækker i tabellen
+    if section
+      headers = section.css('div.tableHeader div.column').map(&:text).map(&:strip) # Henter overskrifterne (årstal eller datafelter)
+      rows = section.css('div.tableBody div.row') # Henter alle rækker i sektionen
 
       # Gå igennem alle rækker for at hente data
       rows.each do |row|
-        data_type = row.at_css('th')&.text&.strip # Finder datatypen (f.eks. 'Revenues')
+        data_type = row.at_css('div.rowTitle')&.text&.strip # Finder datatypen (f.eks. 'Total Revenue')
         next unless data_type # Skipper, hvis ingen datatype fundet
 
-        values = row.css('td').map(&:text).map(&:strip) # Finder alle værdier i rækken (et år per kolonne)
+        values = row.css('div.column').map(&:text).map(&:strip) # Finder alle værdier i rækken (et år per kolonne)
 
         # Matcher værdier med de tilsvarende årstal (header)
         headers.each_with_index do |header, index|
           year = header
           value = values[index] # Finder den tilsvarende værdi
 
-          # Filtrer værdier, der er tomme eller har "view ratings"
-          next if value.nil? || value.empty? || value.downcase.include?("view ratings")
+          next if value.nil? || value.empty? || value == "--"
 
           puts "Symbol: #{symbol}, År: #{year}, Data type: #{data_type}, Værdi: #{value}"
         end
@@ -114,23 +122,6 @@ class SeekingAlphaScraper
     else
       puts "Kunne ikke finde nogen tabel for #{symbol}."
     end
-  end
-
-  def check_robots_txt
-    robots_url = "https://seekingalpha.com/robots.txt"
-    uri = URI(robots_url)
-    response = Net::HTTP.get(uri)
-
-    # Simpel kontrol: Tjek om "Disallow: /symbol" findes
-    disallowed_paths = response.scan(/Disallow: (.+)/).flatten
-    symbol_path = "/symbol"
-
-    if disallowed_paths.any? { |path| symbol_path.start_with?(path) }
-      raise "Scraping af #{symbol_path} er ikke tilladt ifølge robots.txt"
-    end
-  rescue => e
-    puts "Fejl ved tjek af robots.txt: #{e.message}"
-    # Fortsæt eller stop afhængigt af dine behov
   end
 
   # Tag et screenshot ved fejl
@@ -155,5 +146,5 @@ symbol_list = [
 ]
 
 # Opretter instans af klassen og henter data
-scraper = SeekingAlphaScraper.new(symbol_list)
+scraper = YahooFinanceScraper.new(symbol_list)
 scraper.fetch_data
