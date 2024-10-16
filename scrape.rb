@@ -5,6 +5,7 @@ require 'dotenv/load' # Loader miljøvariabler fra .env, hvis nødvendigt
 require 'uri'
 require 'net/http'
 require 'json'
+require 'thread'
 
 class YahooFinanceScraper
   BASE_URL = "https://finance.yahoo.com/quote"
@@ -12,60 +13,64 @@ class YahooFinanceScraper
   MAX_RETRIES = 1
 
   def initialize(symbol_list)
-    @symbol_list = symbol_list
+    @symbol_list = symbol_list.each_slice(5).to_a # Opdel symboler i grupper af 15
   end
 
   def fetch_data
-    @symbol_list.each do |symbol|
-      retries = 0
-      success = false
+    @symbol_list.each do |symbol_group|
+      threads = []
+      symbol_group.each do |symbol|
+        threads << Thread.new do
+          %w[financials balance-sheet cash-flow].each do |page_type|
+            retries = 0
+            success = false
 
-      while retries < MAX_RETRIES && !success
-        puts "Henter data for: #{symbol} (Forsøg #{retries + 1}/#{MAX_RETRIES}a)"
+            while retries < MAX_RETRIES && !success
+              puts "Henter data for: #{symbol} (#{page_type}) (Forsøg #{retries + 1}/#{MAX_RETRIES}a)"
 
-        begin
-          setup_browser
+              begin
+                browser = setup_browser
 
-          url = "#{BASE_URL}/#{symbol}/financials?p=#{symbol}"
-          @browser.go_to(url)
+                url = "#{BASE_URL}/#{symbol}/#{page_type}?p=#{symbol}"
+                browser.go_to(url)
 
-          # Vent indtil siden er fuldt indlæst
-          sleep(5)
+                # Brug JavaScript til at klikke på knapperne, hvis de findes
+                if browser.at_css("#scroll-down-btn")
+                  browser.execute("document.querySelector('#scroll-down-btn').click()")
+                end
+                if browser.at_css("button.reject-all")
+                  browser.execute("document.querySelector('button.reject-all').click()")
+                  sleep(2) # Giver siden tid til at opdatere efter klik
+                end
 
-          # Brug JavaScript til at klikke på knapperne, hvis de findes
-          if @browser.at_css("#scroll-down-btn")
-            @browser.execute("document.querySelector('#scroll-down-btn').click()")
-            sleep(2)
+                # Reducer ventetiden
+                sleep(2)
+
+                page = browser.body
+                parse_page(page, symbol, page_type)
+
+                puts "Færdig med at hente data for: #{symbol} (#{page_type})"
+                success = true
+              rescue Ferrum::TimeoutError
+                puts "Timeout ved hentning af data for: #{symbol} (#{page_type})"
+                take_error_screenshot(browser, symbol, retries + 1, page_type)
+                retries += 1
+              rescue Ferrum::BrowserError => e
+                puts "Fejl ved hentning af data for: #{symbol} (#{page_type}) - #{e.message}"
+                take_error_screenshot(browser, symbol, retries + 1, page_type)
+                retries += 1
+              ensure
+                browser.quit if browser
+              end
+            end
+
+            unless success
+              puts "Kunne ikke hente data for: #{symbol} (#{page_type}) efter #{MAX_RETRIES} forsøg."
+            end
           end
-          if @browser.at_css("button.reject-all")
-            @browser.execute("document.querySelector('button.reject-all').click()")
-            sleep(2)
-          end
-
-          # Vent yderligere for at sikre, at siden er klar
-          sleep(5)
-
-          page = @browser.body
-          parse_page(page, symbol)
-
-          puts "Færdig med at hente data for: #{symbol}"
-          success = true
-        rescue Ferrum::TimeoutError
-          puts "Timeout ved hentning af data for: #{symbol}"
-          take_error_screenshot(symbol, retries + 1)
-          retries += 1
-        rescue Ferrum::BrowserError => e
-          puts "Fejl ved hentning af data for: #{symbol} - #{e.message}"
-          take_error_screenshot(symbol, retries + 1)
-          retries += 1
-        ensure
-          @browser.quit if @browser
         end
       end
-
-      unless success
-        puts "Kunne ikke hente data for: #{symbol} efter #{MAX_RETRIES} forsøg."
-      end
+      threads.each(&:join) # Vent på, at alle tråde i gruppen er færdige
     end
   end
 
@@ -75,11 +80,11 @@ class YahooFinanceScraper
     user_agent = get_random_user_agent
     puts "Bruger User-Agent: #{user_agent}"
 
-    @browser = Ferrum::Browser.new(
+    Ferrum::Browser.new(
       headless: false,
       user_agent: user_agent,
-      window_size: [1200, 800]
-      # Tilføj yderligere stealth-indstillinger her, hvis nødvendigt
+      window_size: [1200, 800],
+      timeout: 10 # Reducer browser timeout for hurtigere fejlhåndtering
     )
   end
 
@@ -94,7 +99,7 @@ class YahooFinanceScraper
     user_agents.sample
   end
 
-  def parse_page(page, symbol)
+  def parse_page(page, symbol, page_type)
     doc = Nokogiri::HTML(page)
     section = doc.at_css('section.container.yf-1pgoo1f') # Finder sektionen med den ønskede tabel
 
@@ -116,19 +121,19 @@ class YahooFinanceScraper
 
           next if value.nil? || value.empty? || value == "--"
 
-          puts "Symbol: #{symbol}, År: #{year}, Data type: #{data_type}, Værdi: #{value}"
+          puts "Symbol: #{symbol}, Side: #{page_type}, År: #{year}, Data type: #{data_type}, Værdi: #{value}"
         end
       end
     else
-      puts "Kunne ikke finde nogen tabel for #{symbol}."
+      puts "Kunne ikke finde nogen tabel for #{symbol} (#{page_type})."
     end
   end
 
   # Tag et screenshot ved fejl
-  def take_error_screenshot(symbol, attempt)
-    if @browser
-      screenshot_name = "error_screenshot_#{symbol}_attempt_#{attempt}.png"
-      @browser.screenshot.save(screenshot_name)
+  def take_error_screenshot(browser, symbol, attempt, page_type)
+    if browser
+      screenshot_name = "error_screenshot_#{symbol}_#{page_type}_attempt_#{attempt}.png"
+      browser.screenshot.save(screenshot_name)
       puts "Error screenshot taget: #{screenshot_name}"
     end
   rescue => e
