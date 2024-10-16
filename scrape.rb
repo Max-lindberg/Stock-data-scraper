@@ -1,7 +1,6 @@
 require 'ferrum'
 require 'nokogiri'
 require 'faker'
-require 'dotenv/load' # Loader miljøvariabler fra .env, hvis nødvendigt
 require 'uri'
 require 'net/http'
 require 'json'
@@ -13,7 +12,7 @@ class YahooFinanceScraper
   MAX_RETRIES = 1
 
   def initialize(symbol_list)
-    @symbol_list = symbol_list.each_slice(5).to_a # Opdel symboler i grupper af 15
+    @symbol_list = symbol_list.each_slice(5).to_a # Opdel symboler i grupper af 5
   end
 
   def fetch_data
@@ -79,14 +78,20 @@ class YahooFinanceScraper
   def setup_browser
     user_agent = get_random_user_agent
     puts "Bruger User-Agent: #{user_agent}"
-
+  
     Ferrum::Browser.new(
-      headless: false,
+      headless: true,  # Kører i headless-tilstand for at spare RAM
       user_agent: user_agent,
       window_size: [1200, 800],
-      timeout: 10 # Reducer browser timeout for hurtigere fejlhåndtering
+      timeout: 20, # Forøg timeout for sideindlæsning
+      process_timeout: 20, # Forøg process timeout
+      browser_options: {
+        'no-sandbox': true,
+        'disable-images': true, # Deaktiver billedindlæsning for at spare tid og båndbredde
+        'disable-stylesheets': true # Deaktiver CSS for at spare indlæsningstid
+      }
     )
-  end
+  end  
 
   def get_random_user_agent
     user_agents = [
