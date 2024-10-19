@@ -1,97 +1,159 @@
-require 'ferrum'
-require 'nokogiri'
-require 'faker'
-require 'uri'
 require 'net/http'
+require 'uri'
 require 'json'
+require 'nokogiri'
+require 'proxylinker'
 require 'thread'
 
 class YahooFinanceScraper
   BASE_URL = "https://finance.yahoo.com/quote"
-
-  MAX_RETRIES = 1
+  MAX_RETRIES = 3
+  MAX_REDIRECTS = 5
+  MAX_THREADS = 10  # Juster dette tal efter behov
 
   def initialize(symbol_list)
-    @symbol_list = symbol_list.each_slice(5).to_a # Opdel symboler i grupper af 5
+    @symbol_list = symbol_list
+    setup_proxy_manager
+    @mutex = Mutex.new
   end
 
   def fetch_data
-    @symbol_list.each do |symbol_group|
-      threads = []
-      symbol_group.each do |symbol|
-        threads << Thread.new do
+    threads = []
+    queue = Queue.new
+    @symbol_list.each { |symbol| queue << symbol }
+
+    MAX_THREADS.times do
+      threads << Thread.new do
+        while !queue.empty?
+          symbol = queue.pop(true) rescue nil
+          break unless symbol
+
           %w[financials balance-sheet cash-flow].each do |page_type|
-            retries = 0
-            success = false
-
-            while retries < MAX_RETRIES && !success
-              puts "Henter data for: #{symbol} (#{page_type}) (Forsøg #{retries + 1}/#{MAX_RETRIES}a)"
-
-              begin
-                browser = setup_browser
-
-                url = "#{BASE_URL}/#{symbol}/#{page_type}?p=#{symbol}"
-                browser.go_to(url)
-
-                # Brug JavaScript til at klikke på knapperne, hvis de findes
-                if browser.at_css("#scroll-down-btn")
-                  browser.execute("document.querySelector('#scroll-down-btn').click()")
-                end
-                if browser.at_css("button.reject-all")
-                  browser.execute("document.querySelector('button.reject-all').click()")
-                  sleep(2) # Giver siden tid til at opdatere efter klik
-                end
-
-                # Reducer ventetiden
-                sleep(2)
-
-                page = browser.body
-                parse_page(page, symbol, page_type)
-
-                puts "Færdig med at hente data for: #{symbol} (#{page_type})"
-                success = true
-              rescue Ferrum::TimeoutError
-                puts "Timeout ved hentning af data for: #{symbol} (#{page_type})"
-                take_error_screenshot(browser, symbol, retries + 1, page_type)
-                retries += 1
-              rescue Ferrum::BrowserError => e
-                puts "Fejl ved hentning af data for: #{symbol} (#{page_type}) - #{e.message}"
-                take_error_screenshot(browser, symbol, retries + 1, page_type)
-                retries += 1
-              ensure
-                browser.quit if browser
-              end
-            end
-
-            unless success
-              puts "Kunne ikke hente data for: #{symbol} (#{page_type}) efter #{MAX_RETRIES} forsøg."
-            end
+            fetch_data_for_symbol(symbol, page_type)
           end
         end
       end
-      threads.each(&:join) # Vent på, at alle tråde i gruppen er færdige
     end
+
+    threads.each(&:join)
+  rescue Interrupt
+    puts "\nAfbryder scraping proces..."
+    exit(0)
   end
 
   private
 
-  def setup_browser
-    user_agent = get_random_user_agent
-    puts "Bruger User-Agent: #{user_agent}"
-  
-    Ferrum::Browser.new(
-      headless: true,  # Kører i headless-tilstand for at spare RAM
-      user_agent: user_agent,
-      window_size: [1200, 800],
-      timeout: 20, # Forøg timeout for sideindlæsning
-      process_timeout: 20, # Forøg process timeout
-      browser_options: {
-        'no-sandbox': true,
-        'disable-images': true, # Deaktiver billedindlæsning for at spare tid og båndbredde
-        'disable-stylesheets': true # Deaktiver CSS for at spare indlæsningstid
-      }
-    )
-  end  
+  def fetch_data_for_symbol(symbol, page_type)
+    retries = 0
+    success = false
+
+    while retries < MAX_RETRIES && !success
+      @mutex.synchronize do
+        puts "Henter data for: #{symbol} (#{page_type}) (Forsøg #{retries + 1}/#{MAX_RETRIES})"
+      end
+
+      begin
+        proxy = get_proxy
+        url = "#{BASE_URL}/#{symbol}/#{page_type}?p=#{symbol}"
+        response = make_request(url, proxy)
+
+        if response.is_a?(Net::HTTPSuccess)
+          parse_page(response.body, symbol, page_type)
+          @mutex.synchronize do
+            puts "Færdig med at hente data for: #{symbol} (#{page_type})"
+          end
+          success = true
+        else
+          @mutex.synchronize do
+            puts "Fejl ved hentning af data for: #{symbol} (#{page_type}) - Status: #{response.code}"
+          end
+          retries += 1
+        end
+      rescue => e
+        @mutex.synchronize do
+          puts "Fejl ved hentning af data for: #{symbol} (#{page_type}) - #{e.message}"
+        end
+        retries += 1
+      end
+
+      sleep(5) unless success # Vent lidt mellem forsøg
+    end
+
+    unless success
+      @mutex.synchronize do
+        puts "Kunne ikke hente data for: #{symbol} (#{page_type}) efter #{MAX_RETRIES} forsøg."
+      end
+    end
+  end
+
+  def setup_proxy_manager
+    proxy_file_path = 'proxy_list.txt'
+    @proxy_list = Proxylinker::ProxyList.new(proxy_file_path)
+  end
+
+  def get_proxy
+    proxy = @proxy_list.get_random_proxy
+    if proxy && proxy_works?(proxy)
+      @mutex.synchronize do
+        puts "Bruger proxy: #{proxy.addr}:#{proxy.port}"
+      end
+      proxy
+    else
+      @mutex.synchronize do
+        puts "Ingen fungerende proxies tilgængelige. Prøver uden proxy."
+      end
+      nil
+    end
+  end
+
+  def proxy_works?(proxy)
+    uri = URI("https://finance.yahoo.com")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    http.open_timeout = 10
+    http.read_timeout = 10
+    http.proxy_addr = proxy.addr
+    http.proxy_port = proxy.port
+    http.proxy_user = proxy.user if proxy.user
+    http.proxy_pass = proxy.pass if proxy.pass
+
+    begin
+      response = http.get("/")
+      return response.code.to_i == 200
+    rescue
+      return false
+    end
+  end
+
+  def make_request(url, proxy = nil, redirect_count = 0)
+    raise ArgumentError, 'For mange omdirigeringer' if redirect_count > MAX_REDIRECTS
+
+    uri = URI(url)
+    http = Net::HTTP.new(uri.host, uri.port, proxy&.addr, proxy&.port, proxy&.user, proxy&.pass)
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    http.open_timeout = 30
+    http.read_timeout = 30
+
+    request = Net::HTTP::Get.new(uri)
+    request['User-Agent'] = get_random_user_agent
+
+    response = http.request(request)
+
+    case response
+    when Net::HTTPSuccess
+      response
+    when Net::HTTPRedirection
+      location = response['location']
+      @mutex.synchronize do
+        puts "Omdirigerer til: #{location}"
+      end
+      make_request(location, proxy, redirect_count + 1)
+    else
+      response
+    end
+  end
 
   def get_random_user_agent
     user_agents = [
@@ -104,55 +166,43 @@ class YahooFinanceScraper
     user_agents.sample
   end
 
-  def parse_page(page, symbol, page_type)
-    doc = Nokogiri::HTML(page)
-    section = doc.at_css('section.container.yf-1pgoo1f') # Finder sektionen med den ønskede tabel
+  def parse_page(html, symbol, page_type)
+    doc = Nokogiri::HTML(html)
+    section = doc.at_css('section.container.yf-1pgoo1f') # Opdater denne selector hvis nødvendigt
 
     if section
-      headers = section.css('div.tableHeader div.column').map(&:text).map(&:strip) # Henter overskrifterne (årstal eller datafelter)
-      rows = section.css('div.tableBody div.row') # Henter alle rækker i sektionen
+      headers = section.css('div.tableHeader div.column').map(&:text).map(&:strip)
+      rows = section.css('div.tableBody div.row')
 
-      # Gå igennem alle rækker for at hente data
       rows.each do |row|
-        data_type = row.at_css('div.rowTitle')&.text&.strip # Finder datatypen (f.eks. 'Total Revenue')
-        next unless data_type # Skipper, hvis ingen datatype fundet
+        data_type = row.at_css('div.rowTitle')&.text&.strip
+        next unless data_type
 
-        values = row.css('div.column').map(&:text).map(&:strip) # Finder alle værdier i rækken (et år per kolonne)
+        values = row.css('div.column').map(&:text).map(&:strip)
 
-        # Matcher værdier med de tilsvarende årstal (header)
         headers.each_with_index do |header, index|
           year = header
-          value = values[index] # Finder den tilsvarende værdi
+          value = values[index]
 
           next if value.nil? || value.empty? || value == "--"
 
-          puts "Symbol: #{symbol}, Side: #{page_type}, År: #{year}, Data type: #{data_type}, Værdi: #{value}"
+          @mutex.synchronize do
+            puts "Symbol: #{symbol}, Side: #{page_type}, År: #{year}, Data type: #{data_type}, Værdi: #{value}"
+          end
         end
       end
     else
-      puts "Kunne ikke finde nogen tabel for #{symbol} (#{page_type})."
+      @mutex.synchronize do
+        puts "Kunne ikke finde nogen tabel for #{symbol} (#{page_type})."
+      end
     end
-  end
-
-  # Tag et screenshot ved fejl
-  def take_error_screenshot(browser, symbol, attempt, page_type)
-    if browser
-      screenshot_name = "error_screenshot_#{symbol}_#{page_type}_attempt_#{attempt}.png"
-      browser.screenshot.save(screenshot_name)
-      puts "Error screenshot taget: #{screenshot_name}"
-    end
-  rescue => e
-    puts "Fejl ved at tage screenshot: #{e.message}"
   end
 end
 
 # Liste over symboler
 symbol_list = [
-  "TSLA", "AAPL", "AMZN", "MSFT", "GOOGL", "FB", "NFLX", "NVDA", "BABA", "INTC", 
-  "V", "MA", "PYPL", "ADBE", "ORCL", "CSCO", "CRM", "UBER", "LYFT", "SPOT",
-  "BA", "NKE", "SBUX", "DIS", "KO", "PEP", "WMT", "TGT", "HD", "LOW", 
-  "JPM", "GS", "BAC", "C", "WFC", "MS", "AMAT", "QCOM", "TXN", "MU",
-  "AMD", "IBM", "HON", "GE", "MMM", "CAT", "UPS", "FDX", "XOM", "CVX"
+  "TSLA", "AAPL", "AMZN", "MSFT", "GOOGL", "FB", "NFLX", "NVDA", "BABA", "INTC",
+  # ... (fortsæt med resten af dine symboler)
 ]
 
 # Opretter instans af klassen og henter data
